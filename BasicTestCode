@@ -1,0 +1,138 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include "MPU6050_light.h"
+ 
+#define TFT_CS   5
+#define TFT_DC   6
+#define TFT_RST  7
+ 
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+MPU6050 mpu(Wire);
+ 
+//Acceleration & Velocity
+float accZ= 0;
+float filteredAccZ= 0;
+float prevFilteredAccZ= 0;
+float velocityZ= 0;
+float filteredVelZ= 0;
+ 
+//Smoothing Parameters
+float alpha= 0.7;
+float velAlpha= 0.5;
+float velDamping= 0.90;
+float velThreshold= 0.015;
+ 
+//Motion Detection
+enum MotionState {STILL, UP, DOWN};
+MotionState motion= STILL;
+MotionState lastMotion= STILL;
+ 
+// FSM to Detect Reps (0-5: DOWN, UP, STILL, UP, DOWN, STILL)
+int seqStep = 0;
+int repCount = 0;
+ 
+unsigned long stateStartTime = 0;
+unsigned long lastTime = 0;
+
+//Variable to Invert Up and Down Detection
+bool invertAxis = false;
+ 
+void setup() {
+  Serial.begin(115200);
+ 
+  SPI.begin();
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextSize(3);
+  tft.setCursor(10, 10);
+  tft.print("Reps: 0");
+ 
+  Wire.begin();
+  delay(200);
+ 
+  if (mpu.begin() != 0) {
+    tft.setCursor(20, 80);
+    tft.print("MPU ERR");
+    while(1);
+  }
+ 
+  mpu.calcOffsets(true, true);
+  lastTime = millis();
+}
+ 
+void loop() {
+  mpu.update();
+ 
+  //Time Step
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  lastTime = now;
+
+  //Acceleration
+  accZ = mpu.getAccZ() - 1.0;
+  if (invertAxis) accZ = -accZ;
+ 
+  filteredAccZ = alpha * filteredAccZ + (1.0 - alpha) * accZ;
+  float deltaAcc = filteredAccZ - prevFilteredAccZ;
+  prevFilteredAccZ = filteredAccZ;
+ 
+  //Velocity
+  velocityZ += deltaAcc * dt * 15.0;
+  velocityZ *= velDamping;
+  filteredVelZ = velAlpha * filteredVelZ + (1.0 - velAlpha) * velocityZ;
+ 
+  //Motion Detection
+  MotionState rawMotion;
+  if (filteredVelZ > velThreshold) rawMotion = UP;
+  else if (filteredVelZ < -velThreshold) rawMotion = DOWN;
+  else rawMotion = STILL;
+ 
+  //Debounce (100 ms)
+  if (rawMotion != lastMotion) {
+    if (stateStartTime == 0) stateStartTime = millis();
+    if (millis() - stateStartTime > 100) {
+      motion = rawMotion;
+      lastMotion = motion;
+    }
+  } else {
+    stateStartTime = 0;
+  }
+ 
+  //Full Sequence Rep Counting
+  //Sequence: DOWN -> UP -> STILL -> UP -> DOWN -> STILL
+  switch(seqStep) {
+    case 0: if (motion == DOWN) seqStep++; break;
+    case 1: if (motion == UP) seqStep++; break;
+    case 2: if (motion == STILL) seqStep++; break;
+    case 3: if (motion == UP) seqStep++; break;
+    case 4: if (motion == DOWN) seqStep++; break;
+    case 5:
+      if (motion == STILL) {
+        repCount++;
+        tft.fillRect(10, 10, 200, 30, ILI9341_BLACK);
+        tft.setCursor(10, 10);
+        tft.print("Reps: ");
+        tft.print(repCount);
+        seqStep = 0; // reset sequence
+      }
+      break;
+  }
+ 
+  // --------------------------
+  // Serial debug
+  // --------------------------
+  Serial.print("Motion: ");
+  if (motion == UP) Serial.print("UP ");
+  else if (motion == DOWN) Serial.print("DOWN ");
+  else Serial.print("STILL ");
+ 
+  Serial.print("SeqStep: ");
+  Serial.print(seqStep);
+  Serial.print(" Reps: ");
+  Serial.println(repCount);
+ 
+  delay(10);
+}
