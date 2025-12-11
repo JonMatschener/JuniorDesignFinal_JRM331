@@ -121,16 +121,5 @@ void loop() {
       break;
   }
 
-  //Debugging Code:
-  Serial.print("Motion: ");
-  if (motion == UP) Serial.print("UP ");
-  else if (motion == DOWN) Serial.print("DOWN ");
-  else Serial.print("STILL ");
- 
-  Serial.print("SeqStep: ");
-  Serial.print(seqStep);
-  Serial.print(" Reps: ");
-  Serial.println(repCount);
- 
   delay(10);
 }
