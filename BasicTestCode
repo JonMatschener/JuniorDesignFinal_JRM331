@@ -120,10 +120,8 @@ void loop() {
       }
       break;
   }
- 
-  // --------------------------
-  // Serial debug
-  // --------------------------
+
+  //Debugging Code:
   Serial.print("Motion: ");
   if (motion == UP) Serial.print("UP ");
   else if (motion == DOWN) Serial.print("DOWN ");
