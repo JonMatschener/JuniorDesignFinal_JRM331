@@ -1,0 +1,157 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include "MPU6050_light.h"
+
+#define TFT_CS   5
+#define TFT_DC   6
+#define TFT_RST  7
+
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+MPU6050 mpu(Wire);
+
+// ---- sensor & motion variables ----
+float accZ = 0.0f;             // raw accel (g) after gravity subtract
+float filteredAccZ = 0.0f;
+float velocityZ = 0.0f;        // velocity in m/s (approx)
+float filteredVelZ = 0.0f;
+
+// ---- tuning parameters (easy to change) ----
+const float ACC_ALPHA = 0.85f;      // accel low-pass: higher = smoother
+const float VEL_BETA  = 0.80f;      // velocity low-pass
+const float DAMPING   = 0.93f;      // velocity damping each loop
+const float VEL_THRESH_UP   = 0.15f;  // m/s threshold to call UP
+const float VEL_THRESH_DOWN = -0.15f; // m/s threshold to call DOWN
+const unsigned long DEBOUNCE_MS = 100; // motion debounce time
+
+bool invertAxis = false; // flip sign if orientation is inverted
+
+// ---- motion state & debouncing ----
+enum MotionState { STILL, UP, DOWN };
+MotionState motion = STILL;
+MotionState lastMotion = STILL;
+unsigned long motionStateStart = 0;
+
+// ---- full sequence FSM (6-step) ----
+// Steps: 0: DOWN, 1: UP, 2: STILL, 3: UP, 4: DOWN, 5: STILL -> count
+int seqStep = 0;
+int repCount = 0;
+
+// ---- timing ----
+unsigned long lastTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // TFT init
+  SPI.begin();
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(10, 10);
+  tft.print("Reps: 0");
+
+  // MPU init
+  Wire.begin();
+  delay(200);
+  if (mpu.begin() != 0) {
+    tft.setCursor(20, 80);
+    tft.setTextColor(ILI9341_RED);
+    tft.print("MPU ERR");
+    while (1);
+  }
+
+  // auto-calibrate offsets
+  mpu.calcOffsets(true, true);
+
+  lastTime = millis();
+}
+
+void loop() {
+  mpu.update();
+
+  // ----- compute dt (seconds) -----
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0f;
+  if (dt <= 0) dt = 0.001f; // safety
+  lastTime = now;
+
+  // ----- read accel Z and remove gravity (approx) -----
+  // mpu.getAccZ() returns g's (1.0 when static aligned with gravity)
+  accZ = mpu.getAccZ() - 1.0f;
+  if (invertAxis) accZ = -accZ;
+
+  // ----- accel low-pass filter -----
+  filteredAccZ = ACC_ALPHA * filteredAccZ + (1.0f - ACC_ALPHA) * accZ;
+
+  // ----- integrate to velocity (convert g -> m/s^2 by *9.81) -----
+  velocityZ += filteredAccZ * 9.81f * dt;
+
+  // ----- damping to control drift -----
+  velocityZ *= DAMPING;
+
+  // ----- velocity low-pass -----
+  filteredVelZ = VEL_BETA * filteredVelZ + (1.0f - VEL_BETA) * velocityZ;
+
+  // ----- motion classification (raw) -----
+  MotionState rawMotion;
+  if (filteredVelZ > VEL_THRESH_UP) rawMotion = UP;
+  else if (filteredVelZ < VEL_THRESH_DOWN) rawMotion = DOWN;
+  else rawMotion = STILL;
+
+  // ----- debounce: require DEBOUNCE_MS of stability before accepting change -----
+  if (rawMotion != lastMotion) {
+    if (motionStateStart == 0) motionStateStart = millis();
+    if (millis() - motionStateStart > DEBOUNCE_MS) {
+      motion = rawMotion;
+      lastMotion = rawMotion;
+      motionStateStart = 0; // reset timer
+    }
+  } else {
+    motionStateStart = 0;
+    motion = rawMotion; // stable
+  }
+
+  // ----- Full sequence FSM: DOWN -> UP -> STILL -> UP -> DOWN -> STILL -----
+  switch (seqStep) {
+    case 0: if (motion == DOWN) seqStep = 1; break;
+    case 1: if (motion == UP) seqStep = 2; break;
+    case 2: if (motion == STILL) seqStep = 3; break;
+    case 3: if (motion == UP) seqStep = 4; break;
+    case 4: if (motion == DOWN) seqStep = 5; break;
+    case 5:
+      if (motion == STILL) {
+        repCount++;
+        updateDisplayRepCount();
+        seqStep = 0; // reset to start next rep
+      }
+      break;
+    default:
+      seqStep = 0;
+      break;
+  }
+
+  // ----- Serial debug -----
+  Serial.print("vel(m/s)=");
+  Serial.print(filteredVelZ, 3);
+  Serial.print(" motion=");
+  Serial.print(motion == UP ? "UP" : motion == DOWN ? "DOWN" : "STILL");
+  Serial.print(" seq=");
+  Serial.print(seqStep);
+  Serial.print(" reps=");
+  Serial.println(repCount);
+
+  delay(10); // small delay (approx 100 Hz sampling)
+}
+
+void updateDisplayRepCount() {
+  // clear portion of display and redraw rep count
+  tft.fillRect(10, 10, 220, 30, ILI9341_BLACK);
+  tft.setCursor(10, 10);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("Reps: ");
+  tft.print(repCount);
+}
