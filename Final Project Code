@@ -1,0 +1,304 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include "MPU6050_light.h"
+#include <SoftwareSerial.h>
+#include "DFRobotDFPlayerMini.h"
+ 
+//Display
+#define TFT_CS   5
+#define TFT_DC   6
+#define TFT_RST  7
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+ 
+//Accelerometer
+MPU6050 mpu(Wire);
+ 
+//DFplayer
+SoftwareSerial dfSerial(4, 3);
+DFRobotDFPlayerMini df;
+ 
+//Buttons
+#define BTN_start_stop 2
+#define BTN_end_workout A1
+#define BTN_mute A0
+bool isMuted = false;
+bool lastMuteState = false;
+ 
+//Variables
+float accZ = 0;
+float filteredAccZ = 0;
+float prevFilteredAccZ = 0;
+float velocityZ = 0;
+float filteredVelZ = 0;
+ 
+//Smoothing
+float alpha = 0.7;
+float velAlpha = 0.5;
+float velDamping = 0.90;
+float velThreshold = 0.015;
+ 
+//Motion Detection
+enum MotionState {still, up, down};
+MotionState motion = still;
+MotionState lastMotion = still;
+ 
+//Reps
+int seqStep = 0;
+int repCount = 0;
+int setReps[50];
+int setCount = 0;
+ 
+//Timer
+unsigned long stateStartTime = 0;
+unsigned long lastTime = 0;
+unsigned long restStartTime = 0;
+ 
+//Stats
+enum DeviceState {
+  Wait_start, Workout_active, Resting, Summary
+};
+DeviceState deviceState = Wait_start;
+ 
+//Change this if accelerometer measurements flipped
+bool invertAxis = false;
+ 
+// End-workout
+bool endWorkoutLatched = false;
+ 
+void playSound(int track) {
+  if (!isMuted) df.play(track);
+}
+ 
+void drawMuteStatus() {
+  tft.fillRect(240, 0, 80, 20, ILI9341_BLACK);
+  tft.setCursor(240, 0);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print(isMuted ? "Muted" : "Sound");
+}
+ 
+void updateMuteButton() {
+  bool pressed = analogRead(BTN_mute) > 500;
+  if (pressed && !lastMuteState) {
+    isMuted = !isMuted;
+    drawMuteStatus();
+  }
+  lastMuteState = pressed;
+}
+ 
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_start_stop, INPUT);
+  pinMode(BTN_end_workout, INPUT);
+  pinMode(BTN_mute, INPUT);
+  SPI.begin();
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+  dfSerial.begin(9600);
+  df.begin(dfSerial);
+  Wire.begin();
+  delay(200);
+  mpu.begin();
+  mpu.calcOffsets(true, true);
+  lastTime = millis();
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(10, 100);
+  tft.print("Press Start to");
+  tft.setCursor(10, 140);
+  tft.print("Begin Workout");
+  drawMuteStatus();
+  playSound(1);
+}
+ 
+void loop() {
+  updateMuteButton();
+ 
+  //End Workout
+  if (analogRead(BTN_end_workout) > 500 && !endWorkoutLatched) {
+    deviceState = Summary;
+    endWorkoutLatched = true;
+    setReps[setCount] = repCount;
+    setCount++;
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(10, 20);
+    tft.setTextSize(3);
+    tft.print("Workout Done");
+    playSound(3);
+    drawMuteStatus();
+    delay(800);
+  }
+ 
+  //Wait to Start
+  if (deviceState == Wait_start) {
+    if (digitalRead(BTN_start_stop) == HIGH) {
+      repCount = 0;
+      seqStep = 0;
+      endWorkoutLatched = false;
+      deviceState = Workout_active;
+      tft.fillScreen(ILI9341_BLACK);
+      tft.setCursor(10, 10);
+      tft.setTextSize(3);
+      tft.print("Reps: 0");
+      drawMuteStatus();
+    }
+    return;
+  }
+ 
+  //Active Workout
+  if (deviceState == Workout_active) {
+    // Stop begin rest
+    if (digitalRead(BTN_start_stop) == HIGH) {
+      deviceState = Resting;
+      restStartTime = millis();
+      setReps[setCount] = repCount;
+      setCount++;
+      tft.fillScreen(ILI9341_BLACK);
+      tft.setCursor(10, 20);
+      tft.setTextSize(3);
+      tft.print("Rest: 180s");
+      playSound(2);
+      drawMuteStatus();
+      return;
+    }
+ 
+    // Motion detection
+    mpu.update();
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+    lastTime = now;
+    accZ = mpu.getAccZ() - 1.0;
+ 
+    if (invertAxis) accZ = -accZ;
+    filteredAccZ = alpha * filteredAccZ + (1.0 - alpha) * accZ;
+    float deltaAcc = filteredAccZ - prevFilteredAccZ;
+    prevFilteredAccZ = filteredAccZ;
+    velocityZ += deltaAcc * dt * 15.0;
+    velocityZ *= velDamping;
+    filteredVelZ = velAlpha * filteredVelZ + (1.0 - velAlpha) * velocityZ;
+    MotionState rawMotion =
+      (filteredVelZ > velThreshold) ? up :
+      (filteredVelZ < -velThreshold) ? down : still;
+ 
+    if (rawMotion != lastMotion) {
+      if (stateStartTime == 0) stateStartTime = millis();
+      if (millis() - stateStartTime > 100) {
+        motion = rawMotion;
+        lastMotion = motion;
+      }
+    } else stateStartTime = 0;
+ 
+    // Rep sequence
+    switch (seqStep) {
+      case 0: if (motion == down) seqStep++; break;
+      case 1: if (motion == up) seqStep++; break;
+      case 2: if (motion == still) seqStep++; break;
+      case 3: if (motion == up) seqStep++; break;
+      case 4: if (motion == down) seqStep++; break;
+      case 5:
+        if (motion == still) {
+          repCount++;
+          tft.fillRect(10, 10, 200, 30, ILI9341_BLACK);
+          tft.setCursor(10, 10);
+          tft.setTextSize(3);
+          tft.print("Reps: ");
+          tft.print(repCount);
+          seqStep = 0;
+        }
+        break;
+    }
+ 
+    drawMuteStatus();
+    return;
+  }
+ 
+  //Rest State
+  if (deviceState == Resting) {
+    static bool restFinishedDisplayed = false;
+ 
+    // Start new set
+    if (digitalRead(BTN_start_stop) == HIGH) {
+      repCount = 0;
+      seqStep = 0;
+      endWorkoutLatched = false;
+      deviceState = Workout_active;
+      tft.fillScreen(ILI9341_BLACK);
+      tft.setCursor(10, 10);
+      tft.setTextSize(3);
+      tft.print("Reps: 0");
+      drawMuteStatus();
+      restFinishedDisplayed = false; // reset the flag for next rest
+      return;
+    }
+ 
+    unsigned long elapsed = (millis() - restStartTime) / 1000;
+    unsigned long remaining = (elapsed >= 180) ? 0 : (180 - elapsed);
+ 
+    // Countdown update
+    tft.fillRect(10, 20, 200, 40, ILI9341_BLACK);
+    tft.setCursor(10, 20);
+    tft.setTextSize(3);
+    tft.print("Rest: ");
+    tft.print(remaining);
+    tft.print("s");
+    drawMuteStatus();
+ 
+    if (remaining == 0) {
+      if (!restFinishedDisplayed) {
+        tft.fillScreen(ILI9341_BLACK);
+        tft.setCursor(10, 100);
+        tft.setTextSize(3);
+        tft.print("Press Start for");
+        tft.setCursor(10, 140);
+        tft.print("Next Set");
+        playSound(2);
+        restFinishedDisplayed = true;
+      }
+      // Wait here until user presses start
+      return;
+    } else {
+      restFinishedDisplayed = false; // reset if countdown is running
+    }
+  }
+ 
+  //Summary Screen
+  if (deviceState == Summary) {
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(10, 10);
+    tft.setTextSize(3);
+    tft.print("Summary:");
+    tft.setTextSize(2);
+    int totalRepsDisplay = 0;
+ 
+    for (int i = 0; i < setCount; i++) {
+      tft.setCursor(10, 60 + i * 20);
+      tft.print("Set ");
+      tft.print(i + 1);
+      tft.print(": ");
+      tft.print(setReps[i]);
+      totalRepsDisplay += setReps[i];
+    }
+    tft.setCursor(10, 200);
+    tft.print("Total Reps: ");
+    tft.print(totalRepsDisplay);
+    drawMuteStatus();
+ 
+    if (digitalRead(BTN_start_stop) == HIGH) {
+      setCount = 0;
+      repCount = 0;
+      endWorkoutLatched = false;
+      deviceState = Wait_start;
+      tft.fillScreen(ILI9341_BLACK);
+      tft.setTextSize(3);
+      tft.setCursor(10, 100);
+      tft.print("Press Start to");
+      tft.setCursor(10, 140);
+      tft.print("Begin Workout");
+      playSound(1);
+      drawMuteStatus();
+    }
+  }
+}
